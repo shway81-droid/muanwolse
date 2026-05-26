@@ -5,6 +5,12 @@ on:
     # 매일 00:00 UTC = 09:00 KST
     - cron: '0 0 * * *'
   workflow_dispatch: {}
+  # state.json 자기-커밋 무한루프 방지를 위해 paths-ignore
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'state.json'
+      - 'README.md'
 
 permissions:
   contents: write  # state.json 커밋용
