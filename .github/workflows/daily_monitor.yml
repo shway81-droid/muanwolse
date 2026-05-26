@@ -1,44 +1,41 @@
-name: monitor
+name: Daily Mokpo Illo Monitor
 
 on:
+  # 매일 00:00 UTC = 09:00 KST 실행
   schedule:
-    # 매일 00:00 UTC = 09:00 KST
     - cron: '0 0 * * *'
-  workflow_dispatch: {}
-  # state.json 자기-커밋 무한루프 방지를 위해 paths-ignore
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'state.json'
-      - 'README.md'
+
+  # 수동 실행 가능
+  workflow_dispatch:
 
 permissions:
   contents: write  # state.json 커밋용
 
-concurrency:
-  group: monitor
-  cancel-in-progress: false
-
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          cache: pip
+          python-version: '3.11'
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: run monitor
+      - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
 
-      - name: commit updated state
+      - name: Commit updated state
         run: |
           if ! git diff --quiet state.json; then
             git config user.name  "monitor-bot"
