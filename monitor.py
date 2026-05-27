@@ -1,12 +1,12 @@
 """
-무안군 일로읍 아파트·주상복합 (전세+월세) 신규 매물 모니터.
+무안군 일로읍 아파트·주상복합 (전세+월세) 매물 일일 리포트.
 
 매 실행마다:
   1. dacgle.com 의 전세/월세 매물 리스트 페이지를 fetch
   2. 매물 카드를 파싱 (offer_id, 제목, 가격, 면적, 층, 등록일, 중개사 등)
-  3. state.json 의 이전 offer_id 집합과 비교 → 신규만 추출
-  4. 신규가 있고, state.json 이 이전부터 존재하면 Telegram 으로 전송
-  5. state.json 업데이트
+  3. 현재 등록된 매물 전체를 Telegram 으로 전송 (0건이어도 발송)
+  4. 3일 연속 0건이면 silent-failure 경고를 추가 발송
+  5. state.json 의 last_run/zero_streak 갱신
 
 환경변수:
   TELEGRAM_BOT_TOKEN  — BotFather 가 발급한 봇 토큰
@@ -214,7 +214,7 @@ def main() -> int:
     sess = requests.Session()
     sess.headers.update(HEADERS)
 
-    all_items: list[dict] = []
+    items_by_trade: dict[str, list[dict]] = {}
     fetch_errors: list[str] = []
     for label, url in SOURCES.items():
         try:
@@ -225,16 +225,16 @@ def main() -> int:
             continue
         items = parse_listings(html, label)
         print(f"[fetch] {label}: {len(items)}건")
-        all_items.extend(items)
+        items_by_trade[label] = items
 
     if len(fetch_errors) == len(SOURCES):
         print("[ERROR] 모든 소스 fetch 실패 — 종료.", file=sys.stderr)
         return 1
 
-    state = load_state()
-    seen: dict = state.get("seen", {})
-    is_first_run = "seen" not in state
+    all_items: list[dict] = [it for lst in items_by_trade.values() for it in lst]
 
+    state = load_state()
+    state.pop("seen", None)  # 더 이상 사용하지 않음 — 누적된 키 정리
     now = datetime.now(KST).isoformat(timespec="seconds")
 
     zero_streak = int(state.get("zero_streak", 0))
@@ -243,6 +243,11 @@ def main() -> int:
     else:
         zero_streak = 0
     state["zero_streak"] = zero_streak
+    state["last_run"] = now
+    if fetch_errors:
+        state["last_partial_failure"] = {"at": now, "sources": fetch_errors}
+    else:
+        state.pop("last_partial_failure", None)
 
     silent_warning = None
     if zero_streak == ZERO_STREAK_WARN:
@@ -252,35 +257,14 @@ def main() -> int:
             "https://github.com/shway81-droid/muanwolse/actions"
         )
 
-    new_items: list[dict] = []
-    for it in all_items:
-        if it["offer_id"] not in seen:
-            new_items.append(it)
-            seen[it["offer_id"]] = {
-                "first_seen": now,
-                "trade": it["trade"],
-                "title": it["title"],
-            }
+    counts = " / ".join(f"{lbl} {len(items_by_trade.get(lbl, []))}건" for lbl in SOURCES)
+    partial_note = f" (※ {', '.join(fetch_errors)} fetch 실패)" if fetch_errors else ""
+    intro = f"🏠 무안 일로읍 매물 현황 — {counts}{partial_note}\n({now})"
 
-    state["seen"] = seen
-    state["last_run"] = now
-    if fetch_errors:
-        state["last_partial_failure"] = {"at": now, "sources": fetch_errors}
-
-    if is_first_run:
-        save_state(state)
-        print(f"[baseline] state.json 생성. 총 {len(all_items)}건을 기준선으로 저장. 알림 미발송.")
-        return 0
-
-    if not new_items and not silent_warning:
-        save_state(state)
-        print(f"[ok] 신규 매물 없음. (zero_streak={zero_streak}, 부분실패={fetch_errors or '없음'})")
-        return 0
-
-    messages: list[str] = []
-    if new_items:
-        intro = f"🏠 무안 일로읍 신규 매물 {len(new_items)}건 ({now})"
-        messages.extend(chunk_messages(intro, new_items))
+    if all_items:
+        messages = chunk_messages(intro, all_items)
+    else:
+        messages = [intro + "\n\n현재 등록된 매물이 없습니다."]
     if silent_warning:
         messages.append(silent_warning)
 
@@ -305,10 +289,9 @@ def main() -> int:
         return 2
 
     save_state(state)
-    if new_items:
-        print(f"[sent] 신규 {len(new_items)}건 발송 완료.")
+    print(f"[sent] 매물 {len(all_items)}건 ({len(messages)}개 메시지) 발송 완료.")
     if silent_warning:
-        print("[sent] silent-failure 경고 발송.")
+        print("[sent] silent-failure 경고 포함.")
     return 0
 
 
