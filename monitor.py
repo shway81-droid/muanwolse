@@ -207,30 +207,51 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
         raise RuntimeError(f"Telegram API {r.status_code}: {r.text[:300]}")
 
 
+ZERO_STREAK_WARN = 3  # 연속 N회 양쪽 0건이면 1회 silent-failure 경고
+
+
 def main() -> int:
     sess = requests.Session()
     sess.headers.update(HEADERS)
 
     all_items: list[dict] = []
+    fetch_errors: list[str] = []
     for label, url in SOURCES.items():
         try:
             html = fetch_html(sess, url)
         except requests.RequestException as e:
             print(f"[ERROR] fetch {label}: {e}", file=sys.stderr)
-            return 1
+            fetch_errors.append(label)
+            continue
         items = parse_listings(html, label)
         print(f"[fetch] {label}: {len(items)}건")
         all_items.extend(items)
 
-    if not all_items:
-        print("[WARN] 매물 0건 — 사이트 구조가 바뀌었을 수 있음. 종료.", file=sys.stderr)
+    if len(fetch_errors) == len(SOURCES):
+        print("[ERROR] 모든 소스 fetch 실패 — 종료.", file=sys.stderr)
         return 1
 
     state = load_state()
     seen: dict = state.get("seen", {})
-    is_first_run = not state  # state.json 자체가 없거나 비어있으면 첫 실행
+    is_first_run = "seen" not in state
 
     now = datetime.now(KST).isoformat(timespec="seconds")
+
+    zero_streak = int(state.get("zero_streak", 0))
+    if not all_items and not fetch_errors:
+        zero_streak += 1
+    else:
+        zero_streak = 0
+    state["zero_streak"] = zero_streak
+
+    silent_warning = None
+    if zero_streak == ZERO_STREAK_WARN:
+        silent_warning = (
+            f"⚠️ 무안 모니터 경고: {ZERO_STREAK_WARN}일 연속 매물 0건입니다.\n"
+            "사이트 구조 변경 또는 차단 가능성이 있습니다.\n"
+            "https://github.com/shway81-droid/muanwolse/actions"
+        )
+
     new_items: list[dict] = []
     for it in all_items:
         if it["offer_id"] not in seen:
@@ -243,19 +264,25 @@ def main() -> int:
 
     state["seen"] = seen
     state["last_run"] = now
+    if fetch_errors:
+        state["last_partial_failure"] = {"at": now, "sources": fetch_errors}
 
     if is_first_run:
         save_state(state)
         print(f"[baseline] state.json 생성. 총 {len(all_items)}건을 기준선으로 저장. 알림 미발송.")
         return 0
 
-    if not new_items:
+    if not new_items and not silent_warning:
         save_state(state)
-        print("[ok] 신규 매물 없음.")
+        print(f"[ok] 신규 매물 없음. (zero_streak={zero_streak}, 부분실패={fetch_errors or '없음'})")
         return 0
 
-    intro = f"🏠 무안 일로읍 신규 매물 {len(new_items)}건 ({now})"
-    messages = chunk_messages(intro, new_items)
+    messages: list[str] = []
+    if new_items:
+        intro = f"🏠 무안 일로읍 신규 매물 {len(new_items)}건 ({now})"
+        messages.extend(chunk_messages(intro, new_items))
+    if silent_warning:
+        messages.append(silent_warning)
 
     if os.environ.get("DRY_RUN") == "1":
         for m in messages:
@@ -278,7 +305,10 @@ def main() -> int:
         return 2
 
     save_state(state)
-    print(f"[sent] 신규 {len(new_items)}건 발송 완료.")
+    if new_items:
+        print(f"[sent] 신규 {len(new_items)}건 발송 완료.")
+    if silent_warning:
+        print("[sent] silent-failure 경고 발송.")
     return 0
 
 
