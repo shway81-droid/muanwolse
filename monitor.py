@@ -1,5 +1,5 @@
 """
-무안군 일로읍 아파트·주상복합 (전세+월세) 매물 일일 리포트.
+무안군 일로읍·삼향읍 아파트·주상복합 (전세+월세) 매물 일일 리포트.
 
 매 실행마다:
   1. dacgle.com 의 전세/월세 매물 리스트 페이지를 fetch
@@ -40,8 +40,10 @@ HEADERS = {
 }
 
 SOURCES = {
-    "전세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=2&areaid=001208&areaid2=005",
-    "월세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=3&areaid=001208&areaid2=005",
+    "일로읍 전세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=2&areaid=001208&areaid2=005",
+    "일로읍 월세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=3&areaid=001208&areaid2=005",
+    "삼향읍 전세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=2&areaid=001208&areaid2=003",
+    "삼향읍 월세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=3&areaid=001208&areaid2=003",
 }
 
 KST = timezone(timedelta(hours=9))
@@ -259,7 +261,7 @@ def main() -> int:
 
     counts = " / ".join(f"{lbl} {len(items_by_trade.get(lbl, []))}건" for lbl in SOURCES)
     partial_note = f" (※ {', '.join(fetch_errors)} fetch 실패)" if fetch_errors else ""
-    intro = f"🏠 무안 일로읍 매물 현황 — {counts}{partial_note}\n({now})"
+    intro = f"🏠 무안 일로읍·삼향읍 매물 현황 — {counts}{partial_note}\n({now})"
 
     if all_items:
         messages = chunk_messages(intro, all_items)
