@@ -64,8 +64,7 @@ NAVER_TRADE_TYPES = [("B1", "전세"), ("B2", "월세")]
 NAVER_MAX_PAGES = 10  # safety cap
 NAVER_TIMEOUT = 45
 
-NAVER_BEARER_RE = re.compile(r'"(Bearer\s+eyJ[A-Za-z0-9_.\-]{20,})"')
-NAVER_BUNDLE_RE = re.compile(r'src="(/_(?:nuxt|next)/[^"]+\.js)"')
+NAVER_JWT_RE = re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}')
 
 KST = timezone(timedelta(hours=9))
 
@@ -158,6 +157,41 @@ def parse_listings(html: str, trade_label: str) -> list[dict]:
     return listings
 
 
+def _naver_collect_js_urls(html: str) -> list[str]:
+    """페이지 HTML에서 script/link 태그가 가리키는 .js URL 을 절대경로로 정규화해 반환."""
+    soup = BeautifulSoup(html, "html.parser")
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        if not raw or ".js" not in raw:
+            return
+        if raw.startswith("//"):
+            absu = "https:" + raw
+        elif raw.startswith("/"):
+            absu = NAVER_BASE_URL + raw
+        elif raw.startswith("http"):
+            absu = raw
+        else:
+            return  # data: 등 무시
+        # naver 도메인 + pstatic CDN 만 신뢰
+        if not any(h in absu for h in ("naver.com", "naver.net", "pstatic.net")):
+            return
+        if absu in seen:
+            return
+        seen.add(absu)
+        urls.append(absu)
+
+    for tag in soup.find_all("script", src=True):
+        add(tag["src"])
+    for tag in soup.find_all("link", href=True):
+        rel = tag.get("rel") or []
+        rel_lc = [r.lower() for r in rel] if isinstance(rel, list) else [str(rel).lower()]
+        if any(r in ("preload", "modulepreload", "prefetch") for r in rel_lc):
+            add(tag["href"])
+    return urls
+
+
 def fetch_naver_token(session: requests.Session) -> str:
     """new.land.naver.com 홈/JS 번들에서 Authorization Bearer JWT 를 추출."""
     headers = {
@@ -168,26 +202,35 @@ def fetch_naver_token(session: requests.Session) -> str:
     r = session.get(NAVER_BASE_URL + "/", headers=headers, timeout=NAVER_TIMEOUT)
     r.raise_for_status()
 
-    # 1) 메인 페이지 inline 스크립트에 들어있는 경우
-    m = NAVER_BEARER_RE.search(r.text)
+    # 1) 메인 HTML 안에 JWT 가 박혀있는 경우 (window.__NUXT__ 등)
+    m = NAVER_JWT_RE.search(r.text)
     if m:
-        return m.group(1)
+        return "Bearer " + m.group(0)
 
-    # 2) 참조된 JS 번들들을 순회하며 토큰 검색 (중복 제거, 짧은 것부터)
-    paths = sorted(set(NAVER_BUNDLE_RE.findall(r.text)), key=len)
-    for path in paths:
+    # 2) 참조된 JS 번들들 (script / modulepreload / preload) 을 순회
+    js_urls = _naver_collect_js_urls(r.text)
+    js_urls.sort(key=len)  # 짧은 entry 청크부터
+    for url in js_urls[:40]:
         try:
-            br = session.get(NAVER_BASE_URL + path, headers=headers, timeout=NAVER_TIMEOUT)
+            br = session.get(url, headers=headers, timeout=NAVER_TIMEOUT)
         except requests.RequestException:
             continue
         if not br.ok:
             continue
-        m = NAVER_BEARER_RE.search(br.text)
+        m = NAVER_JWT_RE.search(br.text)
         if m:
-            return m.group(1)
+            return "Bearer " + m.group(0)
 
+    # 3) 진단 정보 — 텔레그램에 그대로 노출되어 원인 파악에 사용
+    soup = BeautifulSoup(r.text, "html.parser")
+    title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+    script_count = len(soup.find_all("script"))
+    link_count = len(soup.find_all("link"))
+    head_sample = re.sub(r"\s+", " ", r.text[:300])
     raise RuntimeError(
-        f"Bearer 토큰을 찾지 못함 (스캔한 번들 {len(paths)}개)"
+        f"Bearer 토큰을 찾지 못함 "
+        f"(HTML {len(r.text)}B, scripts={script_count}, links={link_count}, "
+        f"js_urls={len(js_urls)}, title={title!r}, head={head_sample!r})"
     )
 
 
