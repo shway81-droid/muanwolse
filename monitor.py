@@ -47,33 +47,25 @@ SOURCES = {
     "삼향읍 월세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=3&areaid=001208&areaid2=003",
 }
 
-# 네이버 부동산 모바일 API — 인증 토큰 없이 동작.
-# cortarNo 는 통계청 행정구역 코드 10자리 (읍/면/동 단위 뒤 2자리는 00).
-NAVER_API_URL = "https://m.land.naver.com/cluster/ajax/articleList"
-NAVER_MOBILE_UA = (
-    "Mozilla/5.0 (Linux; Android 12; SM-G991N) "
+# 네이버 부동산 데스크탑 API — 페이지 JS 번들에서 추출한 Bearer JWT 필요.
+# m.land 모바일 cluster API 는 GH Actions IP 에서 read timeout 발생하여 폐기.
+NAVER_BASE_URL = "https://new.land.naver.com"
+NAVER_API_URL = "https://new.land.naver.com/api/articles"
+NAVER_DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Mobile Safari/537.36"
+    "Chrome/120.0.0.0 Safari/537.36"
 )
-# cortarNo + 지도 bbox 한 쌍. m.land cluster API 는 bbox 도 함께 요구함.
-# 무안 일로읍/삼향읍의 대략적인 행정구역 외접 박스 (위/경도 마진 여유 있게).
 NAVER_REGIONS = {
-    "일로읍": {
-        "cortarNo": "4684033000",
-        "lat": "34.876", "lon": "126.485",
-        "btm": "34.820", "lft": "126.400",
-        "top": "34.920", "rgt": "126.570",
-    },
-    "삼향읍": {
-        "cortarNo": "4684032000",
-        "lat": "34.811", "lon": "126.466",
-        "btm": "34.770", "lft": "126.410",
-        "top": "34.850", "rgt": "126.520",
-    },
+    "일로읍": "4684033000",
+    "삼향읍": "4684032000",
 }
-# B1=전세, B2=월세 — 한 번에 묶어 호출.
-NAVER_TRADE_CODES = "B1:B2"
+NAVER_TRADE_TYPES = [("B1", "전세"), ("B2", "월세")]
 NAVER_MAX_PAGES = 10  # safety cap
+NAVER_TIMEOUT = 45
+
+NAVER_BEARER_RE = re.compile(r'"(Bearer\s+eyJ[A-Za-z0-9_.\-]{20,})"')
+NAVER_BUNDLE_RE = re.compile(r'src="(/_(?:nuxt|next)/[^"]+\.js)"')
 
 KST = timezone(timedelta(hours=9))
 
@@ -166,104 +158,143 @@ def parse_listings(html: str, trade_label: str) -> list[dict]:
     return listings
 
 
-def fetch_naver_articles(session: requests.Session, region_name: str, region_info: dict) -> list[dict]:
-    """네이버 모바일 cluster API 로 한 지역의 전세+월세 매물을 페이지네이션 수집."""
+def fetch_naver_token(session: requests.Session) -> str:
+    """new.land.naver.com 홈/JS 번들에서 Authorization Bearer JWT 를 추출."""
     headers = {
-        "User-Agent": NAVER_MOBILE_UA,
+        "User-Agent": NAVER_DESKTOP_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    }
+    r = session.get(NAVER_BASE_URL + "/", headers=headers, timeout=NAVER_TIMEOUT)
+    r.raise_for_status()
+
+    # 1) 메인 페이지 inline 스크립트에 들어있는 경우
+    m = NAVER_BEARER_RE.search(r.text)
+    if m:
+        return m.group(1)
+
+    # 2) 참조된 JS 번들들을 순회하며 토큰 검색 (중복 제거, 짧은 것부터)
+    paths = sorted(set(NAVER_BUNDLE_RE.findall(r.text)), key=len)
+    for path in paths:
+        try:
+            br = session.get(NAVER_BASE_URL + path, headers=headers, timeout=NAVER_TIMEOUT)
+        except requests.RequestException:
+            continue
+        if not br.ok:
+            continue
+        m = NAVER_BEARER_RE.search(br.text)
+        if m:
+            return m.group(1)
+
+    raise RuntimeError(
+        f"Bearer 토큰을 찾지 못함 (스캔한 번들 {len(paths)}개)"
+    )
+
+
+def fetch_naver_articles(
+    session: requests.Session, region_name: str, cortar_no: str, token: str
+) -> list[dict]:
+    """new.land /api/articles 로 한 지역의 전세/월세 아파트 매물 수집."""
+    headers = {
+        "User-Agent": NAVER_DESKTOP_UA,
         "Accept": "application/json, text/plain, */*",
-        "Referer": "https://m.land.naver.com/",
-        "X-Requested-With": "XMLHttpRequest",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Authorization": token,
+        "Referer": NAVER_BASE_URL + "/",
     }
     collected: list[dict] = []
-    for page in range(1, NAVER_MAX_PAGES + 1):
-        params = {
-            "rletTpCd": "APT",
-            "tradTpCd": NAVER_TRADE_CODES,
-            "z": "13",
-            "lat": region_info["lat"],
-            "lon": region_info["lon"],
-            "btm": region_info["btm"],
-            "lft": region_info["lft"],
-            "top": region_info["top"],
-            "rgt": region_info["rgt"],
-            "cortarNo": region_info["cortarNo"],
-            "showR0": "",
-            "sort": "rank",
-            "page": str(page),
-        }
-        r = session.get(NAVER_API_URL, params=params, headers=headers, timeout=30)
-        if r.status_code != 200:
-            raise RuntimeError(
-                f"HTTP {r.status_code} (params={params}): {r.text[:200]}"
-            )
-        try:
-            data = r.json()
-        except ValueError as e:
-            raise RuntimeError(
-                f"Naver API non-JSON (HTTP {r.status_code}): {r.text[:200]}"
-            ) from e
-        body = data.get("body") or []
-        for it in body:
-            it["_region"] = region_name
-        collected.extend(body)
-        if not data.get("more") or not body:
-            break
+    for trade_code, trade_label in NAVER_TRADE_TYPES:
+        for page in range(1, NAVER_MAX_PAGES + 1):
+            params = {
+                "cortarNo": cortar_no,
+                "order": "rank",
+                "realEstateType": "APT",
+                "tradeType": trade_code,
+                "page": str(page),
+            }
+            r = session.get(NAVER_API_URL, params=params, headers=headers, timeout=NAVER_TIMEOUT)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"HTTP {r.status_code} on {trade_label} page {page}: {r.text[:200]}"
+                )
+            try:
+                data = r.json()
+            except ValueError as e:
+                raise RuntimeError(
+                    f"non-JSON on {trade_label} page {page}: {r.text[:200]}"
+                ) from e
+            articles = data.get("articleList") or []
+            for art in articles:
+                art["_region"] = region_name
+                art["_trade_code"] = trade_code
+                art["_trade_label"] = trade_label
+            collected.extend(articles)
+            if not data.get("isMoreData") or not articles:
+                break
     return collected
 
 
 def _naver_price(item: dict) -> str:
-    """전세는 hanPrc 그대로, 월세는 보증금/월세 만원 포맷."""
-    trade = item.get("tradTpCd")
-    han = (item.get("hanPrc") or "").strip()
-    prc = item.get("prc") or 0
-    rent = item.get("rentPrc") or 0
-    if trade == "B2":  # 월세
-        return f"{prc:,}/{rent:,}만원" if (prc or rent) else (han or "")
-    return han or (f"{prc:,}만원" if prc else "")
+    """전세는 deal_or_warrant 그대로, 월세는 보증금/월세 포맷."""
+    trade = item.get("_trade_code")
+    deal = (item.get("dealOrWarrantPrc") or "").strip()
+    rent = (item.get("rentPrc") or "").strip()
+    if trade == "B2":
+        if deal and rent:
+            return f"{deal}/{rent}"
+        return rent or deal
+    return deal
+
+
+def _fmt_ymd(raw: str) -> str:
+    """YYYYMMDD → YY.MM.DD."""
+    if raw and len(raw) == 8 and raw.isdigit():
+        return f"{raw[2:4]}.{raw[4:6]}.{raw[6:8]}."
+    return raw or ""
 
 
 def format_naver_listing(item: dict) -> str:
     region = item.get("_region", "")
-    trade_nm = item.get("tradTpNm", "")
+    trade_nm = item.get("_trade_label") or item.get("tradeTypeName", "")
     price = _naver_price(item)
     header = f"[{region} {trade_nm}" + (f" · {price}" if price else "") + "]"
 
-    name = item.get("atclNm") or "(단지명 없음)"
-    rlet = item.get("rletTpNm") or ""
+    name = item.get("articleName") or "(단지명 없음)"
+    rlet = item.get("realEstateTypeName") or ""
     title = f"{name}" + (f" ({rlet})" if rlet else "")
 
     meta = []
-    spc1 = item.get("spc1")  # 공급면적
-    spc2 = item.get("spc2")  # 전용면적
-    if spc1 or spc2:
+    a1 = item.get("area1")
+    a2 = item.get("area2")
+    if a1 or a2:
         area_parts = []
-        if spc1:
-            area_parts.append(f"{spc1}㎡")
-        if spc2:
-            area_parts.append(f"전용 {spc2}㎡")
+        if a1:
+            area_parts.append(f"{a1}㎡")
+        if a2:
+            area_parts.append(f"전용 {a2}㎡")
         meta.append("/".join(area_parts))
-    flr = item.get("flrInfo")
+    flr = item.get("floorInfo")
     if flr:
         meta.append(f"{flr}층")
     direction = item.get("direction")
     if direction:
         meta.append(direction)
-    cfm = item.get("atclCfmYmd")
+    cfm = _fmt_ymd(item.get("articleConfirmYmd", ""))
     if cfm:
         meta.append(cfm)
 
     lines = [header, title]
     if meta:
         lines.append(" · ".join(meta))
-    desc = (item.get("atclFetrDesc") or "").strip()
+    desc = (item.get("articleFeatureDesc") or "").strip()
     if desc:
         lines.append(desc)
-    rltr = (item.get("rltrNm") or "").strip()
+    rltr = (item.get("realtorName") or "").strip()
     if rltr:
         lines.append(f"중개: {rltr}")
-    atcl_no = item.get("atclNo")
-    if atcl_no:
-        lines.append(f"https://new.land.naver.com/articles/{atcl_no}")
+    art_no = item.get("articleNo")
+    if art_no:
+        lines.append(f"{NAVER_BASE_URL}/articles/{art_no}")
     return "\n".join(lines)
 
 
@@ -417,15 +448,30 @@ def main() -> int:
     naver_by_region: dict[str, list[dict]] = {}
     naver_errors: list[str] = []
     naver_error_details: list[str] = []
-    for region_name, region_info in NAVER_REGIONS.items():
-        try:
-            naver_by_region[region_name] = fetch_naver_articles(sess, region_name, region_info)
-            print(f"[fetch] 네이버 {region_name}: {len(naver_by_region[region_name])}건")
-        except Exception as e:
-            msg = str(e)
-            print(f"[ERROR] 네이버 fetch {region_name}: {msg}", file=sys.stderr)
+    naver_token: str | None = None
+    try:
+        naver_token = fetch_naver_token(sess)
+        print(f"[fetch] 네이버 토큰 추출 성공 (length={len(naver_token)})")
+    except Exception as e:
+        msg = str(e)
+        print(f"[ERROR] 네이버 토큰 추출 실패: {msg}", file=sys.stderr)
+        # 토큰 없으면 전 지역 실패 처리 — fetch 시도 자체를 스킵.
+        for region_name in NAVER_REGIONS:
             naver_errors.append(region_name)
-            naver_error_details.append(f"• {region_name}: {msg[:300]}")
+        naver_error_details.append(f"• 토큰 추출 실패: {msg[:300]}")
+
+    if naver_token:
+        for region_name, cortar_no in NAVER_REGIONS.items():
+            try:
+                naver_by_region[region_name] = fetch_naver_articles(
+                    sess, region_name, cortar_no, naver_token
+                )
+                print(f"[fetch] 네이버 {region_name}: {len(naver_by_region[region_name])}건")
+            except Exception as e:
+                msg = str(e)
+                print(f"[ERROR] 네이버 fetch {region_name}: {msg}", file=sys.stderr)
+                naver_errors.append(region_name)
+                naver_error_details.append(f"• {region_name}: {msg[:300]}")
     naver_all = [it for lst in naver_by_region.values() for it in lst]
 
     naver_counts = " / ".join(
