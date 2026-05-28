@@ -5,8 +5,9 @@
   1. dacgle.com 의 전세/월세 매물 리스트 페이지를 fetch
   2. 매물 카드를 파싱 (offer_id, 제목, 가격, 면적, 층, 등록일, 중개사 등)
   3. 현재 등록된 매물 전체를 Telegram 으로 전송 (0건이어도 발송)
-  4. 3일 연속 0건이면 silent-failure 경고를 추가 발송
-  5. state.json 의 last_run/zero_streak 갱신
+  4. 별도로 네이버 부동산 모바일 API 에서 동일 지역 매물을 받아 별도 메시지로 발송
+  5. 3일 연속 0건(dacgle 기준)이면 silent-failure 경고를 추가 발송
+  6. state.json 의 last_run/zero_streak 갱신
 
 환경변수:
   TELEGRAM_BOT_TOKEN  — BotFather 가 발급한 봇 토큰
@@ -45,6 +46,22 @@ SOURCES = {
     "삼향읍 전세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=2&areaid=001208&areaid2=003",
     "삼향읍 월세": "https://land.dacgle.com/offer/?cateid_group=0000&trade=3&areaid=001208&areaid2=003",
 }
+
+# 네이버 부동산 모바일 API — 인증 토큰 없이 동작.
+# cortarNo 는 통계청 행정구역 코드 10자리 (읍/면/동 단위 뒤 2자리는 00).
+NAVER_API_URL = "https://m.land.naver.com/cluster/ajax/articleList"
+NAVER_MOBILE_UA = (
+    "Mozilla/5.0 (Linux; Android 12; SM-G991N) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Mobile Safari/537.36"
+)
+NAVER_REGIONS = {
+    "일로읍": "4684033000",
+    "삼향읍": "4684032000",
+}
+# B1=전세, B2=월세 — 한 번에 묶어 호출.
+NAVER_TRADE_CODES = "B1:B2"
+NAVER_MAX_PAGES = 10  # safety cap
 
 KST = timezone(timedelta(hours=9))
 
@@ -135,6 +152,110 @@ def parse_listings(html: str, trade_label: str) -> list[dict]:
             }
         )
     return listings
+
+
+def fetch_naver_articles(session: requests.Session, region_name: str, cortar_no: str) -> list[dict]:
+    """네이버 모바일 cluster API 로 한 cortarNo 의 전세+월세 매물을 페이지네이션 수집."""
+    headers = {
+        "User-Agent": NAVER_MOBILE_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://m.land.naver.com/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    collected: list[dict] = []
+    for page in range(1, NAVER_MAX_PAGES + 1):
+        params = {
+            "rletTpCd": "APT",
+            "tradTpCd": NAVER_TRADE_CODES,
+            "z": "16",
+            "cortarNo": cortar_no,
+            "sort": "rank",
+            "page": str(page),
+        }
+        r = session.get(NAVER_API_URL, params=params, headers=headers, timeout=30)
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise RuntimeError(f"Naver API non-JSON response: {r.text[:200]}") from e
+        body = data.get("body") or []
+        for it in body:
+            it["_region"] = region_name
+        collected.extend(body)
+        if not data.get("more") or not body:
+            break
+    return collected
+
+
+def _naver_price(item: dict) -> str:
+    """전세는 hanPrc 그대로, 월세는 보증금/월세 만원 포맷."""
+    trade = item.get("tradTpCd")
+    han = (item.get("hanPrc") or "").strip()
+    prc = item.get("prc") or 0
+    rent = item.get("rentPrc") or 0
+    if trade == "B2":  # 월세
+        return f"{prc:,}/{rent:,}만원" if (prc or rent) else (han or "")
+    return han or (f"{prc:,}만원" if prc else "")
+
+
+def format_naver_listing(item: dict) -> str:
+    region = item.get("_region", "")
+    trade_nm = item.get("tradTpNm", "")
+    price = _naver_price(item)
+    header = f"[{region} {trade_nm}" + (f" · {price}" if price else "") + "]"
+
+    name = item.get("atclNm") or "(단지명 없음)"
+    rlet = item.get("rletTpNm") or ""
+    title = f"{name}" + (f" ({rlet})" if rlet else "")
+
+    meta = []
+    spc1 = item.get("spc1")  # 공급면적
+    spc2 = item.get("spc2")  # 전용면적
+    if spc1 or spc2:
+        area_parts = []
+        if spc1:
+            area_parts.append(f"{spc1}㎡")
+        if spc2:
+            area_parts.append(f"전용 {spc2}㎡")
+        meta.append("/".join(area_parts))
+    flr = item.get("flrInfo")
+    if flr:
+        meta.append(f"{flr}층")
+    direction = item.get("direction")
+    if direction:
+        meta.append(direction)
+    cfm = item.get("atclCfmYmd")
+    if cfm:
+        meta.append(cfm)
+
+    lines = [header, title]
+    if meta:
+        lines.append(" · ".join(meta))
+    desc = (item.get("atclFetrDesc") or "").strip()
+    if desc:
+        lines.append(desc)
+    rltr = (item.get("rltrNm") or "").strip()
+    if rltr:
+        lines.append(f"중개: {rltr}")
+    atcl_no = item.get("atclNo")
+    if atcl_no:
+        lines.append(f"https://new.land.naver.com/articles/{atcl_no}")
+    return "\n".join(lines)
+
+
+def chunk_naver_messages(intro: str, items: list[dict], limit: int = 3800) -> list[str]:
+    chunks: list[str] = []
+    buf = intro
+    for it in items:
+        block = "\n\n" + format_naver_listing(it)
+        if len(buf) + len(block) > limit and buf != intro:
+            chunks.append(buf)
+            buf = intro + block
+        else:
+            buf += block
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 
 def load_state() -> dict:
@@ -267,6 +388,35 @@ def main() -> int:
         messages = chunk_messages(intro, all_items)
     else:
         messages = [intro + "\n\n현재 등록된 매물이 없습니다."]
+
+    # ---- 네이버 부동산: 별도 메시지로 분리 발송 ----
+    naver_by_region: dict[str, list[dict]] = {}
+    naver_errors: list[str] = []
+    for region_name, cortar_no in NAVER_REGIONS.items():
+        try:
+            naver_by_region[region_name] = fetch_naver_articles(sess, region_name, cortar_no)
+            print(f"[fetch] 네이버 {region_name}: {len(naver_by_region[region_name])}건")
+        except Exception as e:
+            print(f"[ERROR] 네이버 fetch {region_name}: {e}", file=sys.stderr)
+            naver_errors.append(region_name)
+    naver_all = [it for lst in naver_by_region.values() for it in lst]
+
+    naver_counts = " / ".join(
+        f"{rn} {len(naver_by_region.get(rn, []))}건" for rn in NAVER_REGIONS
+    )
+    naver_partial = f" (※ {', '.join(naver_errors)} fetch 실패)" if naver_errors else ""
+    naver_intro = (
+        f"🏘️ [네이버 부동산] 무안 일로읍·삼향읍 아파트 전세/월세 — "
+        f"{naver_counts}{naver_partial}\n({now})"
+    )
+    if naver_all:
+        naver_messages = chunk_naver_messages(naver_intro, naver_all)
+    elif len(naver_errors) == len(NAVER_REGIONS):
+        naver_messages = [naver_intro + "\n\n네이버 부동산 fetch 에 실패했습니다."]
+    else:
+        naver_messages = [naver_intro + "\n\n현재 등록된 매물이 없습니다."]
+    messages.extend(naver_messages)
+
     if silent_warning:
         messages.append(silent_warning)
 
