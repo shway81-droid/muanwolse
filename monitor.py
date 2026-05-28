@@ -55,9 +55,21 @@ NAVER_MOBILE_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Mobile Safari/537.36"
 )
+# cortarNo + 지도 bbox 한 쌍. m.land cluster API 는 bbox 도 함께 요구함.
+# 무안 일로읍/삼향읍의 대략적인 행정구역 외접 박스 (위/경도 마진 여유 있게).
 NAVER_REGIONS = {
-    "일로읍": "4684033000",
-    "삼향읍": "4684032000",
+    "일로읍": {
+        "cortarNo": "4684033000",
+        "lat": "34.876", "lon": "126.485",
+        "btm": "34.820", "lft": "126.400",
+        "top": "34.920", "rgt": "126.570",
+    },
+    "삼향읍": {
+        "cortarNo": "4684032000",
+        "lat": "34.811", "lon": "126.466",
+        "btm": "34.770", "lft": "126.410",
+        "top": "34.850", "rgt": "126.520",
+    },
 }
 # B1=전세, B2=월세 — 한 번에 묶어 호출.
 NAVER_TRADE_CODES = "B1:B2"
@@ -154,8 +166,8 @@ def parse_listings(html: str, trade_label: str) -> list[dict]:
     return listings
 
 
-def fetch_naver_articles(session: requests.Session, region_name: str, cortar_no: str) -> list[dict]:
-    """네이버 모바일 cluster API 로 한 cortarNo 의 전세+월세 매물을 페이지네이션 수집."""
+def fetch_naver_articles(session: requests.Session, region_name: str, region_info: dict) -> list[dict]:
+    """네이버 모바일 cluster API 로 한 지역의 전세+월세 매물을 페이지네이션 수집."""
     headers = {
         "User-Agent": NAVER_MOBILE_UA,
         "Accept": "application/json, text/plain, */*",
@@ -167,17 +179,29 @@ def fetch_naver_articles(session: requests.Session, region_name: str, cortar_no:
         params = {
             "rletTpCd": "APT",
             "tradTpCd": NAVER_TRADE_CODES,
-            "z": "16",
-            "cortarNo": cortar_no,
+            "z": "13",
+            "lat": region_info["lat"],
+            "lon": region_info["lon"],
+            "btm": region_info["btm"],
+            "lft": region_info["lft"],
+            "top": region_info["top"],
+            "rgt": region_info["rgt"],
+            "cortarNo": region_info["cortarNo"],
+            "showR0": "",
             "sort": "rank",
             "page": str(page),
         }
         r = session.get(NAVER_API_URL, params=params, headers=headers, timeout=30)
-        r.raise_for_status()
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"HTTP {r.status_code} (params={params}): {r.text[:200]}"
+            )
         try:
             data = r.json()
         except ValueError as e:
-            raise RuntimeError(f"Naver API non-JSON response: {r.text[:200]}") from e
+            raise RuntimeError(
+                f"Naver API non-JSON (HTTP {r.status_code}): {r.text[:200]}"
+            ) from e
         body = data.get("body") or []
         for it in body:
             it["_region"] = region_name
@@ -392,13 +416,16 @@ def main() -> int:
     # ---- 네이버 부동산: 별도 메시지로 분리 발송 ----
     naver_by_region: dict[str, list[dict]] = {}
     naver_errors: list[str] = []
-    for region_name, cortar_no in NAVER_REGIONS.items():
+    naver_error_details: list[str] = []
+    for region_name, region_info in NAVER_REGIONS.items():
         try:
-            naver_by_region[region_name] = fetch_naver_articles(sess, region_name, cortar_no)
+            naver_by_region[region_name] = fetch_naver_articles(sess, region_name, region_info)
             print(f"[fetch] 네이버 {region_name}: {len(naver_by_region[region_name])}건")
         except Exception as e:
-            print(f"[ERROR] 네이버 fetch {region_name}: {e}", file=sys.stderr)
+            msg = str(e)
+            print(f"[ERROR] 네이버 fetch {region_name}: {msg}", file=sys.stderr)
             naver_errors.append(region_name)
+            naver_error_details.append(f"• {region_name}: {msg[:300]}")
     naver_all = [it for lst in naver_by_region.values() for it in lst]
 
     naver_counts = " / ".join(
@@ -412,7 +439,10 @@ def main() -> int:
     if naver_all:
         naver_messages = chunk_naver_messages(naver_intro, naver_all)
     elif len(naver_errors) == len(NAVER_REGIONS):
-        naver_messages = [naver_intro + "\n\n네이버 부동산 fetch 에 실패했습니다."]
+        detail = "\n".join(naver_error_details)
+        naver_messages = [
+            naver_intro + "\n\n네이버 부동산 fetch 에 실패했습니다.\n" + detail
+        ]
     else:
         naver_messages = [naver_intro + "\n\n현재 등록된 매물이 없습니다."]
     messages.extend(naver_messages)
