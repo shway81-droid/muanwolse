@@ -194,11 +194,31 @@ def _naver_collect_js_urls(html: str) -> list[str]:
 
 def fetch_naver_token(session: requests.Session) -> str:
     """new.land.naver.com 홈/JS 번들에서 Authorization Bearer JWT 를 추출."""
-    headers = {
+    base_headers = {
         "User-Agent": NAVER_DESKTOP_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
+
+    # 0) 메인 네이버를 먼저 방문해 NNB/세션 쿠키를 받는 워밍업.
+    #    anti-bot 우회 — GitHub Actions IP 가 곧바로 new.land 를 치면 메인페이지로 리다이렉트됨.
+    try:
+        session.get("https://www.naver.com/", headers=base_headers, timeout=NAVER_TIMEOUT)
+    except requests.RequestException:
+        pass
+
+    headers = dict(base_headers)
+    headers["Referer"] = "https://www.naver.com/"
+    headers["Sec-Fetch-Site"] = "same-site"
     r = session.get(NAVER_BASE_URL + "/", headers=headers, timeout=NAVER_TIMEOUT)
     r.raise_for_status()
 
@@ -210,9 +230,15 @@ def fetch_naver_token(session: requests.Session) -> str:
     # 2) 참조된 JS 번들들 (script / modulepreload / preload) 을 순회
     js_urls = _naver_collect_js_urls(r.text)
     js_urls.sort(key=len)  # 짧은 entry 청크부터
+    sub_headers = dict(base_headers)
+    sub_headers["Accept"] = "*/*"
+    sub_headers["Sec-Fetch-Dest"] = "script"
+    sub_headers["Sec-Fetch-Mode"] = "no-cors"
+    sub_headers["Sec-Fetch-Site"] = "same-origin"
+    sub_headers["Referer"] = NAVER_BASE_URL + "/"
     for url in js_urls[:40]:
         try:
-            br = session.get(url, headers=headers, timeout=NAVER_TIMEOUT)
+            br = session.get(url, headers=sub_headers, timeout=NAVER_TIMEOUT)
         except requests.RequestException:
             continue
         if not br.ok:
@@ -226,11 +252,12 @@ def fetch_naver_token(session: requests.Session) -> str:
     title = (soup.title.string.strip() if soup.title and soup.title.string else "")
     script_count = len(soup.find_all("script"))
     link_count = len(soup.find_all("link"))
-    head_sample = re.sub(r"\s+", " ", r.text[:300])
+    final_url = r.url
+    head_sample = re.sub(r"\s+", " ", r.text[:200])
     raise RuntimeError(
         f"Bearer 토큰을 찾지 못함 "
         f"(HTML {len(r.text)}B, scripts={script_count}, links={link_count}, "
-        f"js_urls={len(js_urls)}, title={title!r}, head={head_sample!r})"
+        f"js_urls={len(js_urls)}, final_url={final_url}, title={title!r}, head={head_sample!r})"
     )
 
 
