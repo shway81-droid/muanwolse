@@ -8,6 +8,11 @@ on:
   # 수동 실행 가능
   workflow_dispatch:
 
+  # TEMP: PR 검증용 — 머지 전 되돌릴 예정
+  push:
+    branches:
+      - claude/vibrant-archimedes-gRlM7
+
 permissions:
   contents: write  # state.json 커밋용
 
