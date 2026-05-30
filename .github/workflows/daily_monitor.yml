@@ -1,9 +1,11 @@
 name: Daily Mokpo Illo Monitor
 
 on:
-  # 매일 00:00 UTC = 09:00 KST 실행
+  # 매일 00:23 UTC = 09:23 KST 실행
+  # 정시(00:00 UTC)는 전 세계에서 가장 혼잡한 cron 슬롯이라 GitHub이
+  # 스케줄 실행을 지연/누락시키는 경우가 잦음 → 정시를 피해 분 단위로 이동.
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '23 0 * * *'
 
   # 수동 실행 가능
   workflow_dispatch:
