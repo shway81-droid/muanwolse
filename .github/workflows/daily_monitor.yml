@@ -1,20 +1,17 @@
 name: Daily Mokpo Illo Monitor
 
 on:
-  # 매일 00:23 UTC = 09:23 KST 실행
-  # 정시(00:00 UTC)는 전 세계에서 가장 혼잡한 cron 슬롯이라 GitHub이
-  # 스케줄 실행을 지연/누락시키는 경우가 잦음 → 정시를 피해 분 단위로 이동.
+  # 누락 방지용 다중 스케줄: 하루 여러 번 시도하되 monitor.py 의 1일 1회
+  # 가드(last_sent_date)로 메시지는 하루 1통만 발송된다. GitHub 이 한 슬롯을
+  # 지연/누락시켜도 뒤따르는 백업 실행이 그날치를 대신 보낸다.
+  # 정시(00분)는 가장 혼잡해 누락이 잦으므로 모두 23분으로 피한다.
   schedule:
-    - cron: '23 0 * * *'
+    - cron: '23 0 * * *'   # 09:23 KST — 1차(주 발송)
+    - cron: '23 3 * * *'   # 12:23 KST — 백업 1
+    - cron: '23 6 * * *'   # 15:23 KST — 백업 2
 
-  # 수동 실행 가능
+  # 수동 실행 가능 (테스트 시 1일 1회 가드를 무시하고 강제 발송)
   workflow_dispatch:
-
-  # [임시] 테스트 발송용 push 트리거 — 확인 후 제거 예정.
-  # state.json 커밋이 자기 자신을 재트리거하지 않도록 제외.
-  push:
-    branches: [claude/bold-faraday-foE97]
-    paths-ignore: ['state.json']
 
 permissions:
   contents: write  # state.json 커밋용
@@ -41,6 +38,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 수동 실행은 1일 1회 가드를 무시하고 강제 발송(테스트 편의).
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: python monitor.py
 
       - name: Commit updated state
