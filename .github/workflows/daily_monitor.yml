@@ -10,6 +10,12 @@ on:
   # 수동 실행 가능
   workflow_dispatch:
 
+  # [임시] 테스트 발송용 push 트리거 — 확인 후 제거 예정.
+  # state.json 커밋이 자기 자신을 재트리거하지 않도록 제외.
+  push:
+    branches: [claude/bold-faraday-foE97]
+    paths-ignore: ['state.json']
+
 permissions:
   contents: write  # state.json 커밋용
 
