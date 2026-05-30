@@ -4,14 +4,20 @@
 매 실행마다:
   1. dacgle.com 의 전세/월세 매물 리스트 페이지를 fetch
   2. 매물 카드를 파싱 (offer_id, 제목, 가격, 면적, 층, 등록일, 중개사 등)
-  3. 현재 등록된 매물 전체를 Telegram 으로 전송 (0건이어도 발송)
+  3. 그날(KST) 아직 발송 전이면 현재 등록된 매물 전체를 Telegram 으로 전송
+     (0건이어도 발송). 이미 발송했으면 중복 없이 종료.
   4. 3일 연속 0건이면 silent-failure 경고를 추가 발송
-  5. state.json 의 last_run/zero_streak 갱신
+  5. state.json 의 last_run/last_sent_date/zero_streak 갱신
+
+누락 방지: 워크플로는 하루 여러 번(09:23/12:23/15:23 KST) 실행되지만
+last_sent_date 가드 덕분에 메시지는 하루 1통만 나간다. GitHub 이 한 스케줄을
+지연/누락시켜도 뒤따르는 백업 실행이 그날치를 대신 보낸다.
 
 환경변수:
   TELEGRAM_BOT_TOKEN  — BotFather 가 발급한 봇 토큰
   TELEGRAM_CHAT_ID    — 알림 받을 채팅의 chat_id (본인과의 채팅이면 본인 user id)
   DRY_RUN             — "1" 이면 Telegram 발송 생략하고 stdout 으로만 출력
+  FORCE_SEND          — "1" 이면 그날 이미 발송했어도 강제로 다시 발송(테스트용)
 
 종료 코드: 0 정상, 1 fetch/파싱 실패, 2 Telegram 전송 실패.
 """
@@ -238,14 +244,29 @@ def main() -> int:
     state = load_state()
     state.pop("seen", None)  # 더 이상 사용하지 않음 — 누적된 키 정리
     now = datetime.now(KST).isoformat(timespec="seconds")
+    today = datetime.now(KST).date().isoformat()
+    state["last_run"] = now
 
+    dry_run = os.environ.get("DRY_RUN") == "1"
+    force_send = os.environ.get("FORCE_SEND") == "1"
+
+    # 하루 1회만 발송 가드: 같은 날(KST) 이미 보냈으면 — 즉 누락 대비용
+    # 백업 스케줄로 다시 실행된 경우 — 중복 발송 없이 종료한다. 이때
+    # zero_streak 등 '일일 카운터'는 건드리지 않아야 '3일 연속' 의미가
+    # 유지된다(하루 여러 번 실행돼도 하루 1회만 카운트). DRY_RUN/FORCE_SEND
+    # 는 테스트 목적이라 가드를 무시한다.
+    if not dry_run and not force_send and state.get("last_sent_date") == today:
+        print(f"[skip] {today} 이미 발송 완료 — 중복 발송 생략.")
+        save_state(state)
+        return 0
+
+    # --- 여기부터는 '그날의 실제 발송' 경로 (하루 1회) ---
     zero_streak = int(state.get("zero_streak", 0))
     if not all_items and not fetch_errors:
         zero_streak += 1
     else:
         zero_streak = 0
     state["zero_streak"] = zero_streak
-    state["last_run"] = now
     if fetch_errors:
         state["last_partial_failure"] = {"at": now, "sources": fetch_errors}
     else:
@@ -270,7 +291,7 @@ def main() -> int:
     if silent_warning:
         messages.append(silent_warning)
 
-    if os.environ.get("DRY_RUN") == "1":
+    if dry_run:
         for m in messages:
             print("\n----- DRY_RUN MESSAGE -----")
             print(m)
@@ -290,6 +311,7 @@ def main() -> int:
         print(f"[ERROR] Telegram 전송 실패: {e}", file=sys.stderr)
         return 2
 
+    state["last_sent_date"] = today
     save_state(state)
     print(f"[sent] 매물 {len(all_items)}건 ({len(messages)}개 메시지) 발송 완료.")
     if silent_warning:
